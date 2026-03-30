@@ -1,0 +1,13 @@
+/.gradle/
+/build/
+**/build/
+/.idea/
+*.iml
+/local.properties
+.DS_Store
+*.log
+captures/
+.externalNativeBuild/
+.cxx/
+/backend/node_modules/
+/backend/.env

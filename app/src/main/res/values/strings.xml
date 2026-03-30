@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">JARVIS Uzbek</string>
+    <string name="idle_status">Holat: kutish</string>
+    <string name="active_status">Holat: faol</string>
+    <string name="start_session">Sessiyani boshlash</string>
+    <string name="stop_session">Sessiyani to‘xtatish</string>
+    <string name="notification_title">JARVIS faol</string>
+    <string name="notification_text">Ovozli rejim ishga tushdi</string>
+    <string name="open_privacy_settings">Xotira sozlamalari</string>
+    <string name="memory_settings_title">Xotira va maxfiylik</string>
+    <string name="clear_memory">Xotirani tozalash</string>
+    <string name="export_memory">Xotirani eksport qilish</string>
+    <string name="memory_cleared">Barcha xotira tozalandi.</string>
+</resources>
