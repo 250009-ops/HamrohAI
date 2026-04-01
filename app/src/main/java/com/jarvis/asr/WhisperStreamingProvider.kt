@@ -114,12 +114,18 @@ class WhisperStreamingProvider : AsrProvider {
 
                 "partial" -> {
                     val text = payload.optString("text")
-                    if (text.isNotBlank()) listener?.onPartial(text)
+                    if (text.isNotBlank()) {
+                        listener?.onPartial(text)
+                    }
+                    Unit
                 }
 
                 "final" -> {
                     val text = payload.optString("text")
-                    if (text.isNotBlank()) listener?.onFinal(text)
+                    if (text.isNotBlank()) {
+                        listener?.onFinal(text)
+                    }
+                    Unit
                 }
 
                 "error" -> {
@@ -132,6 +138,8 @@ class WhisperStreamingProvider : AsrProvider {
                         else -> listener?.onError(ERROR_SERVER_REPORTED)
                     }
                 }
+
+                else -> Unit
             }
         }.getOrElse {
             listener?.onError(ERROR_PROTOCOL_PARSE_FAILED)

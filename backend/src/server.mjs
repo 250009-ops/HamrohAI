@@ -2,6 +2,7 @@ import http from "node:http";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import OpenAI from "openai";
+import { toFile } from "openai/uploads";
 import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
 
@@ -10,14 +11,18 @@ const env = {
   requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS || 10000),
   openAiApiKey: process.env.OPENAI_API_KEY || "",
   openAiModel: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+  openAiWhisperModel: process.env.OPENAI_WHISPER_MODEL || "whisper-1",
+  openAiTtsModel: process.env.OPENAI_TTS_MODEL || "tts-1",
+  openAiTtsVoice: process.env.OPENAI_TTS_VOICE || "nova",
   whisperUpstreamWs: process.env.WHISPER_UPSTREAM_WS || "",
   ttsUpstreamUrl: process.env.TTS_UPSTREAM_URL || ""
 };
 
 const startupErrors = [];
 if (!env.openAiApiKey) startupErrors.push("OPENAI_API_KEY is required");
-if (!env.whisperUpstreamWs) startupErrors.push("WHISPER_UPSTREAM_WS is required");
-if (!env.ttsUpstreamUrl) startupErrors.push("TTS_UPSTREAM_URL is required");
+
+const whisperMode = env.whisperUpstreamWs ? "relay" : "openai";
+const ttsMode = env.ttsUpstreamUrl ? "relay" : "openai";
 
 const openai = env.openAiApiKey ? new OpenAI({ apiKey: env.openAiApiKey }) : null;
 const app = express();
@@ -46,10 +51,12 @@ app.get("/healthz", (_req, res) => {
   const hasCritical = startupErrors.length > 0;
   res.status(hasCritical ? 503 : 200).json({
     ok: !hasCritical,
+    whisper_mode: whisperMode,
+    tts_mode: ttsMode,
     required_env: {
       openai: Boolean(env.openAiApiKey),
-      whisper: Boolean(env.whisperUpstreamWs),
-      tts: Boolean(env.ttsUpstreamUrl)
+      whisper_relay: Boolean(env.whisperUpstreamWs),
+      tts_relay: Boolean(env.ttsUpstreamUrl)
     },
     errors: startupErrors
   });
@@ -101,33 +108,54 @@ app.post("/v1/tts/synthesize", async (req, res) => {
     res.status(400).json({ error: "invalid_request", request_id: requestId });
     return;
   }
-  if (!env.ttsUpstreamUrl) {
-    res.status(503).json({ error: "tts_not_configured", request_id: requestId });
-    return;
-  }
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), env.requestTimeoutMs);
   try {
-    const upstream = await fetch(env.ttsUpstreamUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(parsed.data),
-      signal: controller.signal
-    });
-    if (!upstream.ok) {
-      const errorText = await safeReadText(upstream);
-      safeLog("tts_upstream_error", requestId, errorText);
-      res.status(502).json({ error: "tts_upstream_failure", request_id: requestId });
+    if (env.ttsUpstreamUrl) {
+      const upstream = await fetch(env.ttsUpstreamUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(parsed.data),
+        signal: controller.signal
+      });
+      if (!upstream.ok) {
+        const errorText = await safeReadText(upstream);
+        safeLog("tts_upstream_error", requestId, errorText);
+        res.status(502).json({ error: "tts_upstream_failure", request_id: requestId });
+        return;
+      }
+      const audio = Buffer.from(await upstream.arrayBuffer());
+      if (audio.length > 10 * 1024 * 1024) {
+        res.status(413).json({ error: "tts_payload_too_large", request_id: requestId });
+        return;
+      }
+      res.status(200).set({
+        "content-type": upstream.headers.get("content-type") || "audio/wav",
+        "cache-control": "no-store"
+      });
+      res.send(audio);
       return;
     }
-    const audio = Buffer.from(await upstream.arrayBuffer());
-    if (audio.length > 10 * 1024 * 1024) {
-      res.status(413).json({ error: "tts_payload_too_large", request_id: requestId });
+
+    if (!openai) {
+      res.status(503).json({ error: "tts_not_configured", request_id: requestId });
       return;
     }
+
+    const speech = await openai.audio.speech.create(
+      {
+        model: env.openAiTtsModel,
+        voice: env.openAiTtsVoice,
+        input: parsed.data.text,
+        response_format: "wav"
+      },
+      { signal: controller.signal }
+    );
+    const audio = Buffer.from(await speech.arrayBuffer());
+    const contentType = "audio/wav";
     res.status(200).set({
-      "content-type": upstream.headers.get("content-type") || "audio/wav",
+      "content-type": contentType,
       "cache-control": "no-store"
     });
     res.send(audio);
@@ -153,18 +181,31 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 wsServer.on("connection", (clientSocket) => {
-  if (!env.whisperUpstreamWs) {
-    sendJson(clientSocket, { event: "error", code: "asr_not_configured" });
-    clientSocket.close(1011, "asr_not_configured");
+  const sessionTimeout = setTimeout(() => {
+    sendJson(clientSocket, { event: "error", code: "session_timeout" });
+    clientSocket.close(1000, "timeout");
+  }, 2 * 60 * 1000);
+
+  const clearSession = () => clearTimeout(sessionTimeout);
+
+  if (env.whisperUpstreamWs) {
+    attachRelayWhisper(clientSocket, clearSession);
     return;
   }
 
+  if (openai) {
+    attachOpenAiWhisper(clientSocket, clearSession);
+    return;
+  }
+
+  sendJson(clientSocket, { event: "error", code: "asr_not_configured" });
+  clearSession();
+  clientSocket.close(1011, "asr_not_configured");
+});
+
+function attachRelayWhisper(clientSocket, clearSession) {
   let started = false;
   let upstreamSocket = null;
-  const sessionTimeout = setTimeout(() => {
-    sendJson(clientSocket, { event: "error", code: "session_timeout" });
-    closePair(clientSocket, upstreamSocket, 1000, "timeout");
-  }, 2 * 60 * 1000);
 
   clientSocket.on("message", (data, isBinary) => {
     if (!started && !isBinary) {
@@ -186,15 +227,164 @@ wsServer.on("connection", (clientSocket) => {
   });
 
   clientSocket.on("close", () => {
-    clearTimeout(sessionTimeout);
+    clearSession();
     closePair(clientSocket, upstreamSocket, 1000, "client_closed");
   });
 
   clientSocket.on("error", () => {
-    clearTimeout(sessionTimeout);
+    clearSession();
     closePair(clientSocket, upstreamSocket, 1011, "client_error");
   });
-});
+}
+
+function attachOpenAiWhisper(clientSocket, clearSession) {
+  let started = false;
+  let speechBuf = Buffer.alloc(0);
+  let inSpeech = false;
+  let silenceMs = 0;
+  let busy = false;
+
+  const SAMPLE_RATE = 16_000;
+  const BYTES_PER_MS = (SAMPLE_RATE * 2) / 1000;
+  const MIN_BYTES = Math.floor(BYTES_PER_MS * 450);
+  const MAX_BYTES = SAMPLE_RATE * 2 * 25;
+  const SILENCE_END_MS = 750;
+  const VOICE_DB = -42;
+
+  const flush = async (asFinal, minBytesOverride) => {
+    const minB = minBytesOverride ?? MIN_BYTES;
+    if (busy || speechBuf.length < minB) return;
+    busy = true;
+    const pcm = speechBuf;
+    speechBuf = Buffer.alloc(0);
+    inSpeech = false;
+    silenceMs = 0;
+
+    const requestId = randomUUID();
+    try {
+      const wav = pcm16leMonoToWav(pcm, SAMPLE_RATE);
+      const file = await toFile(wav, "utterance.wav", { type: "audio/wav" });
+      const tr = await openai.audio.transcriptions.create({
+        file,
+        model: env.openAiWhisperModel,
+        language: "uz"
+      });
+      const text = (tr.text || "").trim();
+      if (clientSocket.readyState !== WebSocket.OPEN) return;
+      if (text) {
+        sendJson(clientSocket, { event: asFinal ? "final" : "partial", text });
+      }
+    } catch (error) {
+      safeLog("openai_whisper_error", requestId, error);
+      if (clientSocket.readyState === WebSocket.OPEN) {
+        sendJson(clientSocket, { event: "error", code: "upstream_error" });
+      }
+    } finally {
+      busy = false;
+    }
+  };
+
+  clientSocket.on("message", async (data, isBinary) => {
+    if (!started && !isBinary) {
+      const parsed = parseJsonSafe(data.toString());
+      if (!parsed || parsed.event !== "start") {
+        sendJson(clientSocket, { event: "error", code: "invalid_start_event" });
+        clientSocket.close(1002, "invalid_start");
+        return;
+      }
+      started = true;
+      sendJson(clientSocket, { event: "ready", protocol: "jarvis-whisper-v1" });
+      return;
+    }
+
+    if (!started) return;
+
+    if (!isBinary) {
+      const parsed = parseJsonSafe(data.toString());
+      if (parsed?.event === "stop") {
+        inSpeech = false;
+        silenceMs = 0;
+        if (speechBuf.length >= MIN_BYTES) {
+          await flush(true);
+        } else if (speechBuf.length >= 3200) {
+          await flush(true, 3200);
+        }
+        return;
+      }
+      return;
+    }
+
+    const frame = Buffer.from(data);
+    const db = pcmFrameRmsDb(frame);
+    const voiced = db > VOICE_DB;
+
+    if (voiced) {
+      inSpeech = true;
+      silenceMs = 0;
+      if (speechBuf.length + frame.length > MAX_BYTES) {
+        await flush(true);
+      }
+      speechBuf = Buffer.concat([speechBuf, frame]);
+      return;
+    }
+
+    if (inSpeech) {
+      silenceMs += frameMs(frame, BYTES_PER_MS);
+      if (silenceMs >= SILENCE_END_MS && speechBuf.length >= MIN_BYTES) {
+        await flush(true);
+      }
+    }
+  });
+
+  clientSocket.on("close", () => {
+    clearSession();
+  });
+
+  clientSocket.on("error", () => {
+    clearSession();
+  });
+}
+
+function pcm16leMonoToWav(pcm, sampleRate) {
+  const headerSize = 44;
+  const dataSize = pcm.length;
+  const buf = Buffer.alloc(headerSize + dataSize);
+  buf.write("RIFF", 0);
+  buf.writeUInt32LE(36 + dataSize, 4);
+  buf.write("WAVE", 8);
+  buf.write("fmt ", 12);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(sampleRate, 24);
+  buf.writeUInt32LE(sampleRate * 2, 28);
+  buf.writeUInt16LE(2, 32);
+  buf.writeUInt16LE(16, 34);
+  buf.write("data", 36);
+  buf.writeUInt32LE(dataSize, 40);
+  pcm.copy(buf, headerSize);
+  return buf;
+}
+
+function pcmFrameRmsDb(buf) {
+  if (buf.length < 2) return -90;
+  let sum = 0;
+  let n = 0;
+  for (let i = 0; i + 1 < buf.length; i += 2) {
+    const s = buf.readInt16LE(i);
+    sum += s * s;
+    n += 1;
+  }
+  if (n === 0) return -90;
+  const rms = Math.sqrt(sum / n);
+  if (rms <= 0) return -90;
+  const db = 20 * Math.log10(rms / 32768);
+  return Math.max(-90, Math.min(0, db));
+}
+
+function frameMs(frame, bytesPerMs) {
+  return frame.length / bytesPerMs;
+}
 
 function openWhisperUpstream(clientSocket, startPayload) {
   const upstream = new WebSocket(env.whisperUpstreamWs);
@@ -300,7 +490,7 @@ async function safeReadText(response) {
 
 server.listen(env.port, () => {
   const mode = startupErrors.length > 0 ? "degraded" : "healthy";
-  console.log(`jarvis-backend listening on :${env.port} (${mode})`);
+  console.log(`jarvis-backend listening on :${env.port} (${mode}) whisper=${whisperMode} tts=${ttsMode}`);
   if (startupErrors.length > 0) {
     console.error(`startup configuration issues: ${startupErrors.join("; ")}`);
   }

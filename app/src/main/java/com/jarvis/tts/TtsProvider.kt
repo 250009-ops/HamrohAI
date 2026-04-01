@@ -26,7 +26,7 @@ interface TtsProvider {
 
 class AndroidTtsProvider(context: Context) : TtsProvider {
     private var initialized = false
-    private val textToSpeech: TextToSpeech
+    private lateinit var textToSpeech: TextToSpeech
 
     override val providerName: String = "android_tts"
 
@@ -103,11 +103,11 @@ class RemoteOpenSourceTtsProvider : TtsProvider {
                             return@use false
                         }
                         val bytes = response.body?.bytes() ?: ByteArray(0)
-                        val pcm = extractPcmData(bytes)
+                        val (pcm, rate) = parseWavForPlayback(bytes)
                         if (pcm.isEmpty()) {
                             return@use false
                         }
-                        playPcm(pcm, sampleRate = 22050, utteranceId = utteranceId)
+                        playPcm(pcm, rate, utteranceId = utteranceId)
                         return@use true
                     }
                 }.getOrElse { false }
@@ -142,14 +142,35 @@ class RemoteOpenSourceTtsProvider : TtsProvider {
         this.listener = listener
     }
 
-    private fun extractPcmData(raw: ByteArray): ByteArray {
-        if (raw.size < 44) return raw
-        val riff = String(raw.copyOfRange(0, 4))
-        val wave = String(raw.copyOfRange(8, 12))
-        if (riff == "RIFF" && wave == "WAVE") {
-            return raw.copyOfRange(44, raw.size)
+    private fun parseWavForPlayback(raw: ByteArray): Pair<ByteArray, Int> {
+        if (raw.size < 44) return Pair(raw, 22050)
+        val riff = String(raw.copyOfRange(0, 4), Charsets.US_ASCII)
+        val wave = String(raw.copyOfRange(8, 12), Charsets.US_ASCII)
+        if (riff != "RIFF" || wave != "WAVE") return Pair(raw, 22050)
+        val sr = readLeU32(raw, 24) ?: 24000
+        val dataOffset = findWavDataOffset(raw) ?: 44
+        if (dataOffset >= raw.size) return Pair(ByteArray(0), sr)
+        return Pair(raw.copyOfRange(dataOffset, raw.size), sr)
+    }
+
+    private fun findWavDataOffset(raw: ByteArray): Int? {
+        var i = 12
+        while (i + 8 <= raw.size) {
+            val id = String(raw.copyOfRange(i, i + 4), Charsets.US_ASCII)
+            val size = readLeU32(raw, i + 4) ?: return null
+            if (id == "data") return i + 8
+            val padded = size + (size % 2)
+            i += 8 + padded
         }
-        return raw
+        return null
+    }
+
+    private fun readLeU32(raw: ByteArray, off: Int): Int? {
+        if (off + 4 > raw.size) return null
+        return (raw[off].toInt() and 0xFF) or
+            ((raw[off + 1].toInt() and 0xFF) shl 8) or
+            ((raw[off + 2].toInt() and 0xFF) shl 16) or
+            ((raw[off + 3].toInt() and 0xFF) shl 24)
     }
 
     private fun playPcm(pcm: ByteArray, sampleRate: Int, utteranceId: String) {
