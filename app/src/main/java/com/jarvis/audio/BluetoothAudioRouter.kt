@@ -12,31 +12,35 @@ class BluetoothAudioRouter(context: Context) {
 
     @Suppress("DEPRECATION")
     fun startRouting() {
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-            val btDevice = devices.firstOrNull {
-                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        runCatching {
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                val btDevice = devices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                }
+                if (btDevice != null) {
+                    audioManager.setCommunicationDevice(btDevice)
+                }
+            } else {
+                audioManager.isBluetoothScoOn = true
+                audioManager.startBluetoothSco()
             }
-            if (btDevice != null) {
-                audioManager.setCommunicationDevice(btDevice)
-            }
-        } else {
-            audioManager.isBluetoothScoOn = true
-            audioManager.startBluetoothSco()
         }
     }
 
     @Suppress("DEPRECATION")
     fun stopRouting() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            audioManager.clearCommunicationDevice()
-        } else {
-            audioManager.stopBluetoothSco()
-            audioManager.isBluetoothScoOn = false
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.clearCommunicationDevice()
+            } else {
+                audioManager.stopBluetoothSco()
+                audioManager.isBluetoothScoOn = false
+            }
+            audioManager.mode = AudioManager.MODE_NORMAL
         }
-        audioManager.mode = AudioManager.MODE_NORMAL
     }
 
     fun speechAudioAttributes(): AudioAttributes {

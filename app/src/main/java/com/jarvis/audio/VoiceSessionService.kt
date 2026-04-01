@@ -21,6 +21,7 @@ import com.jarvis.llm.DialogueOrchestrator
 import com.jarvis.memory.LocalMemoryStore
 import com.jarvis.policy.UzbekOnlyGuard
 import com.jarvis.tts.UzbekTtsEngine
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -32,7 +33,11 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 class VoiceSessionService : Service() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val exceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        telemetry.trackError(SessionErrorType.TtsFailure, "service_exception=${throwable.message.orEmpty()}")
+        updateNotification("Ichki xato: sessiya tiklanmoqda...")
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + exceptionHandler)
     private lateinit var asrClient: StreamingAsrClient
     private lateinit var ttsEngine: UzbekTtsEngine
     private lateinit var orchestrator: DialogueOrchestrator
@@ -64,7 +69,9 @@ class VoiceSessionService : Service() {
             actionDispatcher = ActionDispatcher(this),
             memoryStore = LocalMemoryStore.get(this)
         )
-        registerReceiver(interruptionReceiver, IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY))
+        runCatching {
+            registerReceiver(interruptionReceiver, IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY))
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -78,7 +85,9 @@ class VoiceSessionService : Service() {
     override fun onDestroy() {
         stopSession()
         ttsEngine.shutdown()
-        unregisterReceiver(interruptionReceiver)
+        runCatching {
+            unregisterReceiver(interruptionReceiver)
+        }
         scope.cancel()
         super.onDestroy()
     }
@@ -91,7 +100,10 @@ class VoiceSessionService : Service() {
         startForeground(NOTIFICATION_ID, createNotification(getString(R.string.notification_text)))
         telemetry.trackInfo("Voice session started")
         latencyTracker.startTurn()
-        audioRouter.startRouting()
+        runCatching { audioRouter.startRouting() }
+            .onFailure {
+                telemetry.trackError(SessionErrorType.TtsFailure, "audio_route_start_failed")
+            }
         telemetry.trackInfo("ASR path: ${asrClient.selectedPathName()}")
         startListeningLoop()
     }
@@ -101,7 +113,7 @@ class VoiceSessionService : Service() {
         active = false
         asrClient.stop()
         ttsEngine.stop()
-        audioRouter.stopRouting()
+        runCatching { audioRouter.stopRouting() }
         telemetry.trackInfo("Voice session stopped")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -141,8 +153,15 @@ class VoiceSessionService : Service() {
                             telemetry.trackError(SessionErrorType.TtsFailure, "ack_tts_failed")
                         },
                         onDone = {
-                            scope.launch {
-                                val finalReply = replyDeferred.await()
+                            scope.launch replyLaunch@{
+                                val finalReply = runCatching { replyDeferred.await() }.getOrNull()
+                                if (finalReply == null) {
+                                    telemetry.trackError(SessionErrorType.ServerUnavailable, "reply_await_failed")
+                                    if (active) {
+                                        startListeningLoop()
+                                    }
+                                    return@replyLaunch
+                                }
                                 speakFinalReply(finalReply.text)
                             }
                         }

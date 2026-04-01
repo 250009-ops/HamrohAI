@@ -74,6 +74,7 @@ class RemoteOpenSourceTtsProvider : TtsProvider {
     @Volatile
     private var stopRequested = false
     private var listener: SimpleUtteranceListener? = null
+    private val trackLock = Any()
     private var activeTrack: AudioTrack? = null
 
     override val providerName: String = "remote_open_source_tts"
@@ -125,12 +126,7 @@ class RemoteOpenSourceTtsProvider : TtsProvider {
 
     override fun stop() {
         stopRequested = true
-        runCatching {
-            activeTrack?.pause()
-            activeTrack?.flush()
-            activeTrack?.release()
-        }
-        activeTrack = null
+        releaseActiveTrack()
     }
 
     override fun shutdown() {
@@ -200,25 +196,51 @@ class RemoteOpenSourceTtsProvider : TtsProvider {
             .setTransferMode(AudioTrack.MODE_STREAM)
             .setBufferSizeInBytes(minBuffer * 2)
             .build()
-        activeTrack = track
-        listener?.onStart(utteranceId)
-        track.play()
-        var offset = 0
-        while (offset < pcm.size && !stopRequested) {
-            val toWrite = (pcm.size - offset).coerceAtMost(2048)
-            val written = track.write(pcm, offset, toWrite)
-            if (written <= 0) break
-            offset += written
+        synchronized(trackLock) {
+            activeTrack = track
         }
-        track.stop()
-        track.flush()
-        track.release()
-        activeTrack = null
+        listener?.onStart(utteranceId)
+        runCatching {
+            track.play()
+            var offset = 0
+            while (offset < pcm.size && !stopRequested) {
+                val toWrite = (pcm.size - offset).coerceAtMost(2048)
+                val written = track.write(pcm, offset, toWrite)
+                if (written <= 0) break
+                offset += written
+            }
+        }.onFailure {
+            listener?.onError(utteranceId)
+        }
+        releaseTrack(track)
+        synchronized(trackLock) {
+            if (activeTrack === track) {
+                activeTrack = null
+            }
+        }
         if (stopRequested) {
             listener?.onError(utteranceId)
         } else {
             listener?.onDone(utteranceId)
         }
+    }
+
+    private fun releaseActiveTrack() {
+        val track = synchronized(trackLock) {
+            val t = activeTrack
+            activeTrack = null
+            t
+        }
+        if (track != null) {
+            releaseTrack(track)
+        }
+    }
+
+    private fun releaseTrack(track: AudioTrack) {
+        runCatching { track.pause() }
+        runCatching { track.flush() }
+        runCatching { track.stop() }
+        runCatching { track.release() }
     }
 
     companion object {
