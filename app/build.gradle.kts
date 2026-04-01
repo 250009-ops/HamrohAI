@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -8,11 +10,16 @@ fun String.toBuildConfigString(): String {
     return "\"" + replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 }
 
+val localProperties = Properties()
+val localPropsFile = rootProject.file("local.properties")
+if (localPropsFile.exists()) {
+    localPropsFile.inputStream().use { localProperties.load(it) }
+}
+
 fun readConfig(name: String): String {
-    return providers.environmentVariable(name)
-        .orElse(providers.gradleProperty(name))
-        .orElse("")
-        .get()
+    System.getenv(name)?.takeIf { it.isNotBlank() }?.let { return it }
+    (project.findProperty(name) as? String)?.takeIf { it.isNotBlank() }?.let { return it }
+    return localProperties.getProperty(name)?.trim().orEmpty()
 }
 
 val llmEndpoint = readConfig("LLM_ENDPOINT")
