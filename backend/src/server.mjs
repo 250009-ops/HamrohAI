@@ -266,8 +266,7 @@ function attachOpenAiWhisper(clientSocket, clearSession) {
       const file = await toFile(wav, "utterance.wav", { type: "audio/wav" });
       const tr = await openai.audio.transcriptions.create({
         file,
-        model: env.openAiWhisperModel,
-        language: "uz"
+        model: env.openAiWhisperModel
       });
       const text = (tr.text || "").trim();
       if (clientSocket.readyState !== WebSocket.OPEN) return;

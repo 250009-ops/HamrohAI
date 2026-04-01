@@ -21,7 +21,7 @@ If both are set, the server **proxies** ASR/TTS to your own upstreams instead of
 
 If these are **empty**, the server uses:
 
-- **ASR:** OpenAI `audio.transcriptions` (`OPENAI_WHISPER_MODEL`, default `whisper-1`). The WebSocket contract to the app is unchanged; audio is buffered and transcribed after pauses (not token‑level streaming partials).
+- **ASR:** OpenAI `audio.transcriptions` (`OPENAI_WHISPER_MODEL`, default `whisper-1`) with language auto-detection (no forced `uz` parameter). The WebSocket contract to the app is unchanged; audio is buffered and transcribed after pauses (not token-level streaming partials).
 - **TTS:** OpenAI `audio.speech` (`OPENAI_TTS_MODEL` / `OPENAI_TTS_VOICE`), returning **WAV** to the app.
 
 **Other optional variables**
